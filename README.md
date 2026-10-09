@@ -68,9 +68,30 @@ theorem foo : ∀ n : Nat, 0 + n = n := by
 When `clank` succeeds, it closes the goal and shows a "Try this" suggestion. Replace `clank`
 with the suggested proof so your builds don't depend on a model.
 
+## How the search works
+
+The server searches in rounds, each drawing `clank.samples` proofs from the model and checking
+all new ones in one Lean run. The default schedule is `fresh,repair,repair,fresh`:
+
+- **fresh**: sample proofs for the goal.
+- **repair**: pick the most promising failed attempts so far, i.e. those whose first error comes
+  latest, and ask the model to fix them, showing Lean's error messages.
+
+The search stops at the first round that finds a verified proof. **Cleanup** then removes
+redundant steps: it tries deleting each step, trailing `<;> tac` or simp lemma list, and keeps
+the shortest version that still checks. The search plans its rounds to finish within
+`clank.timeout`. Change the schedule with `--schedule`, e.g. `--schedule fresh` for a single
+round.
+
+## Benchmark
+
+[bench/](bench/) holds 40 miniF2F problems and the results of comparing search configurations.
+See [bench/README.md](bench/README.md).
+
 ## Layout
 
 - [Clank/](Clank/): the Lean tactic (options, HTTP client, tactic)
 - [server/](server/): the Python prover server (`pytest` in `server/` runs its tests)
 - [docs/protocol.md](docs/protocol.md): the JSON protocol between the tactic and the server
 - [examples/Demo.lean](examples/Demo.lean): sample uses (needs a running server)
+- [bench/](bench/): benchmark problems and harness (a separate Lake project with Mathlib)

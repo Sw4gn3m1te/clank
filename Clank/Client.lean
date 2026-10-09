@@ -11,7 +11,7 @@ namespace Clank
 open Lean
 
 /-- Version of the tactic/server protocol. Bump together with `docs/protocol.md`. -/
-def protocolVersion : Nat := 1
+def protocolVersion : Nat := 2
 
 /-- A local hypothesis of the goal. `name` is `none` for inaccessible (hygienic) hypotheses. -/
 structure Hypothesis where
@@ -27,8 +27,12 @@ structure ProveRequest where
   target : String
   universes : Array String
   imports : Array String
+  /-- Arguments of the `open` commands in scope, e.g. `Real` or `Nat hiding add`. -/
+  opens : Array String
   leanVersion : String
   samples : Nat
+  /-- Seconds until the tactic gives up on the request (`clank.timeout`). -/
+  timeout : Nat
 
 structure Candidate where
   tactic : String
@@ -50,8 +54,10 @@ def ProveRequest.toJson (r : ProveRequest) : Json :=
     ("target", r.target),
     ("universes", Lean.toJson r.universes),
     ("imports", Lean.toJson r.imports),
+    ("opens", Lean.toJson r.opens),
     ("lean_version", r.leanVersion),
-    ("samples", r.samples)]
+    ("samples", r.samples),
+    ("timeout", r.timeout)]
 
 def Candidate.fromJson? (j : Json) : Except String Candidate := do
   return { tactic := ← j.getObjValAs? String "tactic", verified := ← j.getObjValAs? Bool "verified" }

@@ -8,13 +8,17 @@ import pytest
 needs_lean = pytest.mark.skipif(shutil.which("lean") is None, reason="lean not on PATH")
 
 
-def fake_llm(replies: list[str]) -> httpx.MockTransport:
-    """An OpenAI-compatible endpoint that cycles through `replies`."""
-    cycle = itertools.cycle(replies)
+def fake_llm(replies) -> httpx.MockTransport:
+    """An OpenAI-compatible endpoint. `replies` is a list to cycle through, or a function from the
+    last user message to a reply."""
+    if not callable(replies):
+        cycle = itertools.cycle(replies)
+        replies = lambda _: next(cycle)  # noqa: E731
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path.endswith("/chat/completions")
-        assert json.loads(request.content)["messages"][-1]["role"] == "user"
-        return httpx.Response(200, json={"choices": [{"message": {"content": next(cycle)}}]})
+        last = json.loads(request.content)["messages"][-1]
+        assert last["role"] == "user"
+        return httpx.Response(200, json={"choices": [{"message": {"content": replies(last["content"])}}]})
 
     return httpx.MockTransport(handler)
