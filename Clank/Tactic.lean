@@ -51,25 +51,40 @@ def parseProof (text : String) : CoreM (Except String Syntax) := do
     if stx.isOfKind ``Parser.Term.byTactic then return .ok stx[1]
     else return .error "candidate is not a tactic block"
 
+/-- The `open` commands in scope, as arguments to `open` (e.g. `Real`, `Nat hiding add`). The server
+replays them so that the pretty-printed goal, which may use scoped notation, parses again. -/
+def openArgs : CoreM (Array String) := do
+  let mut args := #[]
+  for decl in (← getOpenDecls).reverse do
+    if let .simple ns except := decl then
+      if ns.isAnonymous then continue
+      let suffix := if except.isEmpty then "" else " hiding " ++ " ".intercalate (except.map toString)
+      args := args.push (toString ns ++ suffix)
+  return args
+
 /-- Build the server request for `goal`. -/
-def mkRequest (goal : MVarId) (samples : Nat) : TacticM ProveRequest := goal.withContext do
+def mkRequest (goal : MVarId) (samples timeout : Nat) : TacticM ProveRequest := goal.withContext do
   let goalText := toString (← ppGoal goal)
-  -- Fully qualified names make the statement independent of the `open`s in the user's file.
-  withOptions (fun o => o.setBool `pp.fullNames true) do
+  -- The statement must parse again on the server: without binder types, `∃ f, f 1 = 2` does not.
+  withOptions (·.setBool `pp.funBinderTypes true) do
     let mut hypotheses := #[]
     for decl in ← getLCtx do
       if decl.isImplementationDetail then continue
       let name := if decl.userName.hasMacroScopes then none else some decl.userName.toString
       let value ← decl.value?.mapM fun v => return toString (← ppExpr v)
       hypotheses := hypotheses.push { name, type := toString (← ppExpr decl.type), value }
+    -- Proofs never need the tactic itself.
+    let imports := (← getEnv).imports.map (·.module) |>.filter (!(`Clank).isPrefixOf ·)
     return {
       goal := goalText
       hypotheses
       target := toString (← ppExpr (← goal.getType))
       universes := (← Term.getLevelNames).reverse.toArray.map (·.toString)
-      imports := (← getEnv).imports.map (·.module.toString)
+      imports := imports.map (·.toString)
+      opens := ← openArgs
       leanVersion := Lean.versionString
-      samples }
+      samples
+      timeout }
 
 /-- Check that the (now assigned) `goal` has an acceptable proof term. -/
 def checkProofTerm (goal : MVarId) : TacticM Unit := do
@@ -125,8 +140,9 @@ syntax (name := clank) "clank" : tactic
 @[tactic clank] def evalClank : Tactic := fun stx => withMainContext do
   let goal ← getMainGoal
   let opts ← getOptions
-  let req ← mkRequest goal (clank.samples.get opts)
-  let resp ← prove (clank.endpoint.get opts) req (clank.timeout.get opts)
+  let timeout := clank.timeout.get opts
+  let req ← mkRequest goal (clank.samples.get opts) timeout
+  let resp ← prove (clank.endpoint.get opts) req timeout
   let mut failures : Array MessageData := #[]
   for cand in resp.proofs do
     let text := dedent cand.tactic
@@ -142,5 +158,15 @@ syntax (name := clank) "clank" : tactic
   let details := failures.toList.take 3 |>.map (m!"\n\n" ++ ·)
   throwError m!"clank: no proof found ({resp.proofs.size} candidates returned){note}" ++
     MessageData.joinSep details m!""
+
+/-- `clank_dump` logs the JSON request `clank` would send for the main goal and closes it with
+`sorry`. Used to build benchmark inputs and to debug the protocol. -/
+syntax (name := clankDump) "clank_dump" : tactic
+
+@[tactic clankDump] def evalClankDump : Tactic := fun _ => withMainContext do
+  let opts ← getOptions
+  let req ← mkRequest (← getMainGoal) (clank.samples.get opts) (clank.timeout.get opts)
+  logInfo m!"{req.toJson.compress}"
+  (← getMainGoal).admit
 
 end Clank

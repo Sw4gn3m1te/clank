@@ -31,26 +31,63 @@ def statement(req: ProveRequest, name: str = "clank_goal") -> str:
     return f"theorem {name}{' ' + binders if binders else ''} :\n    {req.target} := by"
 
 
-def messages(req: ProveRequest, style: str = "prover") -> list[dict[str, str]]:
+def preamble(req: ProveRequest) -> str:
+    """Imports and `open`s of the user's file, as Lean source."""
+    lines = [f"import {m}" for m in req.imports if m != "Init"]
+    if req.opens:
+        lines += ["", *(f"open {o}" for o in req.opens)]
+    return "\n".join(lines).strip("\n")
+
+
+def _uncomment(text: str) -> str:
+    """Make `text` safe to embed in a Lean block comment."""
+    return text.replace("-/", "- /").replace("/-", "/ -")
+
+
+def messages(
+    req: ProveRequest, style: str = "prover", attempt: tuple[str, str] | None = None
+) -> list[dict[str, str]]:
+    """Prompt for a proof of `req`. `attempt` is a failed proof and Lean's errors on it, which the
+    model is asked to repair."""
     if style == "prover":
-        return prover_messages(req)
+        return prover_messages(req, attempt)
+    code = "\n\n".join(p for p in (preamble(req), statement(req)) if p)
     user = (
         f"Prove the following Lean 4 goal.\n\n```lean\n{req.goal}\n```\n\n"
-        f"Equivalently, complete this theorem:\n\n```lean\n{statement(req)}\n```"
+        f"Equivalently, complete this theorem:\n\n```lean\n{code}\n```"
     )
-    if req.imports:
-        user += f"\n\nThe file imports: {', '.join(req.imports)}."
     if req.lean_version:
-        user += f"\nLean version: {req.lean_version}."
-    return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]
+        user += f"\n\nLean version: {req.lean_version}."
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]
+    if attempt:
+        proof, errors = attempt
+        msgs += [
+            {"role": "assistant", "content": f"```lean\n{proof}\n```"},
+            {
+                "role": "user",
+                "content": f"Lean rejected this proof:\n\n{errors}\n\n"
+                "Write a corrected proof. Reply with the tactic proof only, in a ```lean block.",
+            },
+        ]
+    return msgs
 
 
-def prover_messages(req: ProveRequest) -> list[dict[str, str]]:
+def prover_messages(
+    req: ProveRequest, attempt: tuple[str, str] | None = None
+) -> list[dict[str, str]]:
     """The "complete this file" format that Lean prover models (DeepSeek-Prover, Goedel-Prover,
-    Kimina-Prover) are trained on: no system prompt, a Lean file ending in `sorry`."""
-    imports = "".join(f"import {m}\n" for m in req.imports if m != "Init")
-    goal = textwrap.indent(req.goal, "  ")
-    code = f"{imports}\n/- Goal:\n{goal}\n-/\n{statement(req)}\n  sorry".lstrip()
+    Kimina-Prover) are trained on: no system prompt, a Lean file ending in `sorry`. A failed attempt
+    to repair goes into a comment above the theorem."""
+    parts = [preamble(req), f"/- Goal:\n{textwrap.indent(req.goal, '  ')}\n-/"]
+    if attempt:
+        proof, errors = attempt
+        parts.append(
+            "/- A previous proof attempt failed.\nAttempt:\n"
+            f"{textwrap.indent(_uncomment(proof), '  ')}\n"
+            f"Lean errors:\n{textwrap.indent(_uncomment(errors), '  ')}\n"
+            "Write a corrected proof. -/"
+        )
+    code = "\n\n".join(p for p in parts if p) + f"\n{statement(req)}\n  sorry"
     content = f"Complete the following Lean 4 code:\n\n```lean4\n{code}\n```"
     return [{"role": "user", "content": content}]
 

@@ -1,4 +1,7 @@
 /.lake/
+/bench/.lake
+# Benchmark runs (logs and per-problem results); summaries go in bench/README.md
+/bench/results/
 __pycache__/
 *.pyc
 .venv/

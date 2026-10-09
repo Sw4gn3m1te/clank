@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 class Hypothesis(BaseModel):
@@ -21,8 +21,13 @@ class ProveRequest(BaseModel):
     target: str
     universes: list[str] = Field(default_factory=list)
     imports: list[str] = Field(default_factory=list)
+    # Arguments of the `open` commands in scope, e.g. "Real" or "Nat hiding add".
+    opens: list[str] = Field(default_factory=list)
     lean_version: str | None = None
     samples: int = Field(default=8, ge=1)
+    # Seconds until the tactic gives up on the request. The server plans its search to finish
+    # well before then.
+    timeout: float | None = None
 
 
 class Candidate(BaseModel):
@@ -35,3 +40,5 @@ class Candidate(BaseModel):
 class ProveResponse(BaseModel):
     proofs: list[Candidate]
     message: str | None = None
+    # Diagnostics about the search (rounds, samples, timings). Informational only.
+    stats: dict | None = None
