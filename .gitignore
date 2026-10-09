@@ -1,0 +1,9 @@
+/.lake/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# Local assistant instructions
+CLAUDE.md

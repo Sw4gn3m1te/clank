@@ -1,0 +1,6 @@
+name = "clank"
+version = "0.1.0"
+defaultTargets = ["Clank"]
+
+[[lean_lib]]
+name = "Clank"
