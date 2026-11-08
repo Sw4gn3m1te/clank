@@ -7,8 +7,9 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, HTTPException
 
+from .cache import ProofCache
 from .config import Settings
-from .lean import LeanChecker
+from .lean import ReplChecker, make_checker
 from .llm import LLMClient
 from .protocol import PROTOCOL_VERSION, ProveRequest, ProveResponse
 from .prover import Prover
@@ -19,12 +20,19 @@ def create_app(
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     llm = LLMClient(settings, transport=llm_transport)
-    prover = Prover(settings, llm, LeanChecker(settings))
+    cache = ProofCache(settings.cache_path) if settings.cache_path else None
+    checker = make_checker(settings)
+    prover = Prover(settings, llm, checker, cache)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        if isinstance(checker, ReplChecker) and settings.warm_imports:
+            await checker.warm(list(settings.warm_imports))
         yield
         await llm.aclose()
+        await checker.close()
+        if cache:
+            cache.close()
 
     app = FastAPI(title="clank server", lifespan=lifespan)
 

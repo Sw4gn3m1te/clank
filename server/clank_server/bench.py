@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 from .config import Settings, add_arguments, from_arguments
-from .lean import LeanChecker
+from .lean import make_checker
 from .llm import LLMClient
 from .protocol import ProveRequest
 from .prover import Prover
@@ -66,7 +66,8 @@ async def _run(args: argparse.Namespace, settings: Settings) -> dict:
         problems = [p for p in problems if p["name"] in args.only]
     problems = problems[: args.limit]
     llm = LLMClient(settings)
-    prover = Prover(settings, llm, LeanChecker(settings))
+    checker = make_checker(settings)
+    prover = Prover(settings, llm, checker)
     results = []
     width = max(len(p["name"]) for p in problems)
     try:
@@ -97,6 +98,7 @@ async def _run(args: argparse.Namespace, settings: Settings) -> dict:
             print(f"[{i:2}/{len(problems)}] {p['name']:<{width}} {secs:6.1f}s  {status}", flush=True)
     finally:
         await llm.aclose()
+        await checker.close()
     return {
         "label": args.label,
         "settings": {
@@ -114,7 +116,7 @@ async def _run(args: argparse.Namespace, settings: Settings) -> dict:
 
 
 def run(args: argparse.Namespace) -> None:
-    settings = from_arguments(args, Settings.from_env())
+    settings = from_arguments(args, Settings.load()[0])
     report = asyncio.run(_run(args, settings))
     args.out_dir.mkdir(parents=True, exist_ok=True)
     out = args.out_dir / f"{args.label}.json"
@@ -176,15 +178,17 @@ def main() -> None:
     e.add_argument("--out", type=Path, default=BENCH / "requests.jsonl")
     e.set_defaults(func=extract)
 
-    r = sub.add_parser("run", help="run the prover on every request")
+    env, config = Settings.load()
+    r = sub.add_parser("run", help="run the prover on every request", parents=[config])
     r.add_argument("--label", required=True, help="name of this run (results file name)")
     r.add_argument("--requests", type=Path, default=BENCH / "requests.jsonl")
     r.add_argument("--samples", type=int, default=8, help="samples per round")
     r.add_argument("--limit", type=int, default=None)
     r.add_argument("--only", nargs="*", help="problem names to run")
     r.add_argument("--out-dir", type=Path, default=BENCH / "results")
-    add_arguments(r, Settings.from_env())
-    r.set_defaults(func=run, lean_project=BENCH)
+    add_arguments(r, env)
+    # A benchmark must not be answered from the cache.
+    r.set_defaults(func=run, lean_project=BENCH, cache_path=None)
 
     s = sub.add_parser("summary", help="compare result files")
     s.add_argument("files", nargs="+")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 
 class Hypothesis(BaseModel):
@@ -12,6 +12,12 @@ class Hypothesis(BaseModel):
     name: str | None
     type: str
     value: str | None = None
+
+
+class Premise(BaseModel):
+    name: str
+    # The lemma's signature, e.g. "Nat.add_comm (n m : Nat) : n + m = m + n".
+    statement: str
 
 
 class ProveRequest(BaseModel):
@@ -28,6 +34,10 @@ class ProveRequest(BaseModel):
     # Seconds until the tactic gives up on the request. The server plans its search to finish
     # well before then.
     timeout: float | None = None
+    # Source text of the file before the `clank` call, for the model to read.
+    context: str = ""
+    # Library lemmas matching the goal, as hints.
+    premises: list[Premise] = Field(default_factory=list)
 
 
 class Candidate(BaseModel):

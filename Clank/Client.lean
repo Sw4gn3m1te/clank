@@ -11,13 +11,19 @@ namespace Clank
 open Lean
 
 /-- Version of the tactic/server protocol. Bump together with `docs/protocol.md`. -/
-def protocolVersion : Nat := 2
+def protocolVersion : Nat := 3
 
 /-- A local hypothesis of the goal. `name` is `none` for inaccessible (hygienic) hypotheses. -/
 structure Hypothesis where
   name : Option String
   type : String
   value : Option String := none
+
+/-- A library lemma that may help, e.g. one `apply?` would try. -/
+structure Premise where
+  name : String
+  /-- The lemma's signature, e.g. `Nat.add_comm (n m : Nat) : n + m = m + n`. -/
+  statement : String
 
 /-- Body of `POST /v1/prove`. -/
 structure ProveRequest where
@@ -33,6 +39,9 @@ structure ProveRequest where
   samples : Nat
   /-- Seconds until the tactic gives up on the request (`clank.timeout`). -/
   timeout : Nat
+  /-- Source text of the file before the `clank` call (trimmed), for the model to read. -/
+  context : String := ""
+  premises : Array Premise := #[]
 
 structure Candidate where
   tactic : String
@@ -57,7 +66,9 @@ def ProveRequest.toJson (r : ProveRequest) : Json :=
     ("opens", Lean.toJson r.opens),
     ("lean_version", r.leanVersion),
     ("samples", r.samples),
-    ("timeout", r.timeout)]
+    ("timeout", r.timeout),
+    ("context", r.context),
+    ("premises", Json.arr (r.premises.map fun p => Json.mkObj [("name", p.name), ("statement", p.statement)]))]
 
 def Candidate.fromJson? (j : Json) : Except String Candidate := do
   return { tactic := ← j.getObjValAs? String "tactic", verified := ← j.getObjValAs? Bool "verified" }

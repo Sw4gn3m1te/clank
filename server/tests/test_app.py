@@ -7,7 +7,7 @@ from clank_server.config import Settings
 from conftest import fake_llm, needs_lean
 
 REQ = {
-    "protocol": 2,
+    "protocol": 3,
     "goal": "a b : Nat\n⊢ a + b = b + a",
     "hypotheses": [{"name": "a", "type": "Nat"}, {"name": "b", "type": "Nat"}],
     "target": "a + b = b + a",
@@ -20,6 +20,7 @@ REQ = {
 
 
 def client(replies, **settings):
+    settings.setdefault("cache_path", None)
     return TestClient(create_app(Settings(**settings), llm_transport=fake_llm(replies)))
 
 
@@ -99,6 +100,25 @@ def test_unrestatable_goal_returns_unverified():
 
 def test_llm_failure():
     transport = httpx.MockTransport(lambda r: httpx.Response(500, text="boom"))
-    with TestClient(create_app(Settings(), llm_transport=transport)) as c:
+    with TestClient(create_app(Settings(cache_path=None), llm_transport=transport)) as c:
         body = c.post("/v1/prove", json=REQ).json()
     assert body["proofs"] == [] and "inference failed" in body["message"]
+
+
+@needs_lean
+def test_cache_returns_verified_proofs_without_sampling(tmp_path):
+    calls = []
+
+    def reply(prompt):
+        calls.append(prompt)
+        return "```lean\nomega\n```"
+
+    with client(reply, cache_path=tmp_path / "cache.sqlite") as c:
+        first = c.post("/v1/prove", json=REQ).json()
+        n = len(calls)
+        second = c.post("/v1/prove", json=REQ).json()
+        renamed = {**REQ, "hypotheses": [{"name": "x", "type": "Nat"}, {"name": "b", "type": "Nat"}]}
+        c.post("/v1/prove", json=renamed)
+    assert second["proofs"] == first["proofs"] == [{"tactic": "omega", "verified": True}]
+    assert second["stats"]["cache"] == "hit"
+    assert len(calls) > n == REQ["samples"]  # the hit sampled nothing, the renamed goal did

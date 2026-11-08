@@ -23,7 +23,7 @@ From `server/`, with an inference server running (see the top-level README):
 
 ```sh
 python -m clank_server.bench extract                  # Bench/MiniF2F.lean -> requests.jsonl
-python -m clank_server.bench run --label repair       # default schedule
+python -m clank_server.bench run --label repair --schedule fresh,repair,repair,fresh
 python -m clank_server.bench run --label fresh4 --schedule fresh,fresh,fresh,fresh
 python -m clank_server.bench summary results/fresh4.json results/repair.json
 ```

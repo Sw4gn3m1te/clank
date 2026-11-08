@@ -12,8 +12,10 @@ from .config import Settings, add_arguments, from_arguments
 
 
 def main() -> None:
-    env = Settings.from_env()
-    p = argparse.ArgumentParser(prog="clank-server", description="Prover server for the clank tactic.")
+    env, config = Settings.load()
+    p = argparse.ArgumentParser(
+        prog="clank-server", description="Prover server for the clank tactic.", parents=[config]
+    )
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
     add_arguments(p, env)

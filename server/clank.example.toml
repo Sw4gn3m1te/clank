@@ -1,0 +1,23 @@
+# Example clank server configuration. Use it with `--config clank.toml` or CLANK_CONFIG.
+# Keys are the setting names in clank_server/config.py; command-line flags override them.
+
+llm_url = "http://127.0.0.1:8080/v1"
+model = "default"
+prompt_style = "prover"           # "chat" for general instruction-tuned models
+temperature = 0.8
+max_tokens = 1024
+context_chars = 1500
+max_premises = 8
+
+schedule = ["fresh", "repair", "repair", "decompose"]
+repair_width = 4
+max_sketches = 2
+time_budget = 100.0               # seconds
+cleanup = true
+cache_path = "~/.cache/clank/proofs.sqlite"   # "" disables the cache
+
+lean_project = ".."               # relative to this file
+lean_timeout = 120.0
+max_parallel_checks = 2
+# repl_path = "~/.cache/clank/repl-v4.23.0/.lake/build/bin/repl"
+# warm_imports = ["Mathlib"]

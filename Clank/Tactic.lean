@@ -48,8 +48,11 @@ def parseProof (text : String) : CoreM (Except String Syntax) := do
   match Parser.runParserCategory (← getEnv) `term src "<clank>" with
   | .error e => return .error s!"parse error: {e}"
   | .ok stx =>
-    if stx.isOfKind ``Parser.Term.byTactic then return .ok stx[1]
-    else return .error "candidate is not a tactic block"
+    if !stx.isOfKind ``Parser.Term.byTactic then return .error "candidate is not a tactic block"
+    -- Running a candidate that calls `clank` would recurse into the server.
+    if (stx.find? fun s => s.isOfKind `Clank.clank || s.isOfKind `Clank.clankDump).isSome then
+      return .error "candidate calls clank"
+    return .ok stx[1]
 
 /-- The `open` commands in scope, as arguments to `open` (e.g. `Real`, `Nat hiding add`). The server
 replays them so that the pretty-printed goal, which may use scoped notation, parses again. -/
@@ -86,6 +89,44 @@ def mkRequest (goal : MVarId) (samples timeout : Nat) : TacticM ProveRequest := 
       samples
       timeout }
 
+/-- Run `x` with `n` thousand heartbeats. Errors, including runtime ones, yield `fallback`. -/
+def withBudget (n : Nat) (fallback : α) (x : TacticM α) : TacticM α :=
+  tryCatchRuntimeEx
+    (withCurrHeartbeats <| withTheReader Core.Context ({ · with maxHeartbeats := n * 1000 }) x)
+    fun e => do if e.isInterrupt then throw e else return fallback
+
+open LibrarySearch in
+/-- Up to `n` library lemmas whose conclusion matches the goal, in the order `apply?` would try
+them. They are only hints for the model, so a failing search just returns fewer. -/
+def findPremises (goal : MVarId) (n : Nat) : TacticM (Array Premise) := do
+  if n == 0 then return #[]
+  withBudget 20000 #[] <| goal.withContext <| withoutModifyingState do
+    let mut out : Array Premise := #[]
+    for (_, (name, _)) in ← librarySearchSymm libSearchFindDecls goal do
+      if out.size ≥ n then break
+      if out.any (·.name == name.toString) then continue
+      let sig ← PrettyPrinter.ppSignature name
+      out := out.push { name := name.toString, statement := toString sig.fmt }
+    return out
+
+/-- The last `n` characters of the file before `ref`, starting at a line boundary. -/
+def fileContext (ref : Syntax) (n : Nat) : TacticM String := do
+  let some pos := ref.getPos? | return ""
+  if n == 0 then return ""
+  let before := (← getFileMap).source.extract 0 pos
+  if before.length ≤ n then return before
+  let tail := before.drop (before.length - n)
+  return (tail.dropWhile (· != '\n')).drop 1
+
+/-- The request for the main goal, with the file context and premise hints. -/
+def fullRequest (ref : Syntax) : TacticM ProveRequest := do
+  let goal ← getMainGoal
+  let opts ← getOptions
+  let req ← mkRequest goal (clank.samples.get opts) (clank.timeout.get opts)
+  return { req with
+    context := ← fileContext ref (clank.context.get opts)
+    premises := ← findPremises goal (clank.premises.get opts) }
+
 /-- Check that the (now assigned) `goal` has an acceptable proof term. -/
 def checkProofTerm (goal : MVarId) : TacticM Unit := do
   let pf ← instantiateMVars (mkMVar goal)
@@ -99,26 +140,50 @@ def checkProofTerm (goal : MVarId) : TacticM Unit := do
 
 /--
 Run candidate `tac` on the main goal. On success the goal is closed and `none` is returned;
-on failure the state is restored and the error is returned.
+on failure the state is restored and the error is returned. With `maxHeartbeats?`, the candidate
+gets that many heartbeats (in thousands, like the `maxHeartbeats` option) instead of the usual
+limit.
 -/
-def runCandidate (goal : MVarId) (tac : Syntax) : TacticM (Option MessageData) := do
+def runCandidate (goal : MVarId) (tac : Syntax) (maxHeartbeats? : Option Nat := none) :
+    TacticM (Option MessageData) := do
   let saved ← saveState
   let msgs ← Core.getMessageLog
   Core.resetMessageLog
-  try
-    Term.withoutErrToSorry <| withoutRecover <| evalTactic tac
-    let unsolved ← getUnsolvedGoals
-    unless unsolved.isEmpty do throwError "unsolved goals{indentD (goalsToMessageData unsolved)}"
-    checkProofTerm goal
-    let newMsgs ← Core.getMessageLog
-    if newMsgs.hasErrors then throwError "candidate produced errors"
-    Core.setMessageLog (msgs ++ newMsgs)
-    return none
-  catch e =>
-    if e.isInterrupt || e.isRuntime then throw e
-    saved.restore (restoreInfo := true)
-    Core.setMessageLog msgs
-    return some e.toMessageData
+  let limit (x : TacticM Unit) : TacticM Unit := match maxHeartbeats? with
+    | some n => withCurrHeartbeats <| withTheReader Core.Context ({ · with maxHeartbeats := n * 1000 }) x
+    | none => x
+  -- Runtime exceptions (heartbeats, recursion depth) mean this candidate failed, not `clank`.
+  tryCatchRuntimeEx
+    (do
+      limit <| Term.withoutErrToSorry <| withoutRecover <| evalTactic tac
+      let unsolved ← getUnsolvedGoals
+      unless unsolved.isEmpty do throwError "unsolved goals{indentD (goalsToMessageData unsolved)}"
+      checkProofTerm goal
+      let newMsgs ← Core.getMessageLog
+      if newMsgs.hasErrors then throwError "candidate produced errors"
+      Core.setMessageLog (msgs ++ newMsgs)
+      return none)
+    fun e => do
+      if e.isInterrupt then throw e
+      saved.restore (restoreInfo := true)
+      Core.setMessageLog msgs
+      return some e.toMessageData
+
+/-- Cheap tactics `clank` tries before asking the server. Tactics that are unavailable (e.g.
+`norm_num` without Mathlib) fail to parse and are skipped. -/
+def fastPathTactics : List String :=
+  ["rfl", "decide", "omega", "simp", "norm_num", "linarith", "positivity"]
+
+/-- Heartbeats (in thousands) for each fast-path tactic. -/
+def fastPathHeartbeats : Nat := 20000
+
+/-- Try `fastPathTactics` on `goal` and return the first that closes it. -/
+def fastPath (goal : MVarId) (ref : Syntax) : TacticM (Option String) := do
+  for text in fastPathTactics do
+    if let .ok tac ← parseProof text then
+      if (← runCandidate goal (relocate (SourceInfo.fromRef ref) tac) fastPathHeartbeats).isNone then
+        return some text
+  return none
 
 /--
 Format `tac` for a "Try this" replacing `ref`. If `ref` starts its line, continuation lines are
@@ -140,9 +205,11 @@ syntax (name := clank) "clank" : tactic
 @[tactic clank] def evalClank : Tactic := fun stx => withMainContext do
   let goal ← getMainGoal
   let opts ← getOptions
-  let timeout := clank.timeout.get opts
-  let req ← mkRequest goal (clank.samples.get opts) timeout
-  let resp ← prove (clank.endpoint.get opts) req timeout
+  if clank.fastPath.get opts then
+    if let some tac ← fastPath goal stx then
+      addSuggestion stx { suggestion := .string tac }
+      return
+  let resp ← prove (clank.endpoint.get opts) (← fullRequest stx) (clank.timeout.get opts)
   let mut failures : Array MessageData := #[]
   for cand in resp.proofs do
     let text := dedent cand.tactic
@@ -163,10 +230,8 @@ syntax (name := clank) "clank" : tactic
 `sorry`. Used to build benchmark inputs and to debug the protocol. -/
 syntax (name := clankDump) "clank_dump" : tactic
 
-@[tactic clankDump] def evalClankDump : Tactic := fun _ => withMainContext do
-  let opts ← getOptions
-  let req ← mkRequest (← getMainGoal) (clank.samples.get opts) (clank.timeout.get opts)
-  logInfo m!"{req.toJson.compress}"
+@[tactic clankDump] def evalClankDump : Tactic := fun stx => withMainContext do
+  logInfo m!"{(← fullRequest stx).toJson.compress}"
   (← getMainGoal).admit
 
 end Clank

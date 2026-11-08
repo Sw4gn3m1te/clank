@@ -1,33 +1,52 @@
 import asyncio
+import os
+import time
+from pathlib import Path
+
+import pytest
 
 from clank_server.config import Settings
-from clank_server.lean import LeanChecker, render
+from clank_server.lean import LeanChecker, ReplChecker, render
 from clank_server.protocol import Hypothesis, ProveRequest
 
 from conftest import needs_lean
 
 REQ = ProveRequest(
-    protocol=2,
+    protocol=3,
     goal="a b : Nat\n⊢ a + b = b + a",
     hypotheses=[Hypothesis(name="a", type="Nat"), Hypothesis(name="b", type="Nat")],
     target="a + b = b + a",
     imports=["Init"],
 )
 
+REPL = Path(
+    os.environ.get("CLANK_TEST_REPL")
+    or Path.home() / ".cache/clank/repl-v4.23.0/.lake/build/bin" / ("repl.exe" if os.name == "nt" else "repl")
+)
+CHECKERS = [
+    "batch",
+    pytest.param("repl", marks=pytest.mark.skipif(not REPL.exists(), reason="no Lean REPL build")),
+]
 
-def check(proof: str, req: ProveRequest = REQ):
-    return asyncio.run(LeanChecker(Settings()).check(req, proof))
+
+@pytest.fixture(params=CHECKERS)
+def checker(request):
+    if request.param == "batch":
+        yield LeanChecker(Settings())
+    else:
+        c = ReplChecker(Settings(max_parallel_checks=1), REPL)
+        yield c
+        asyncio.run(c.close())
 
 
-def check_many(proofs: list[str], req: ProveRequest = REQ):
-    return asyncio.run(LeanChecker(Settings()).check_many(req, proofs))
+def run(coro):
+    return asyncio.run(coro)
 
 
 def test_render():
-    req = REQ.model_copy(update={"opens": ["Nat", "List hiding map"]})
+    req = REQ.model_copy(update={"opens": ["Nat", "List hiding map"], "imports": ["Init", "Foo"]})
     src, spans = render(req, ["intro\nomega", "rfl"])
-    assert "import" not in src
-    assert "open Nat\nopen List hiding map\n" in src
+    assert src.startswith("import Foo\nset_option autoImplicit false\nopen Nat\nopen List hiding map\n")
     lines = src.splitlines()
     assert lines[spans[0].first - 1] == "theorem clank_check_0 (a : Nat) (b : Nat) :"
     assert lines[spans[0].proof - 1 : spans[0].last] == ["  intro", "  omega", "#print axioms clank_check_0"]
@@ -35,28 +54,24 @@ def test_render():
 
 
 @needs_lean
-def test_accepts_valid_proof():
-    assert check("omega").ok
-    assert check("exact Nat.add_comm a b").ok
+def test_accepts_valid_proof(checker):
+    assert run(checker.check(REQ, "omega")).ok
+    assert run(checker.check(REQ, "exact Nat.add_comm a b")).ok
 
 
 @needs_lean
-def test_rejects_wrong_proof():
-    r = check("rfl")
+def test_rejects_wrong_proof_sorry_and_axioms(checker):
+    r = run(checker.check(REQ, "rfl"))
     assert not r.ok and r.errors
-
-
-@needs_lean
-def test_rejects_sorry_and_axioms():
-    assert not check("sorry").ok
+    assert not run(checker.check(REQ, "sorry")).ok
     req = REQ.model_copy(update={"hypotheses": [], "target": "2 + 2 = 4"})
-    assert check("decide", req).ok
-    assert not check("native_decide", req).ok
+    assert run(checker.check(req, "decide")).ok
+    assert not run(checker.check(req, "native_decide")).ok
 
 
 @needs_lean
-def test_batch_attributes_errors():
-    results = check_many(["omega", "skip\nexact foo", "rfl", "skip", "/- open comment"])
+def test_batch_attributes_errors(checker):
+    results = run(checker.check_many(REQ, ["omega", "skip\nexact foo", "rfl", "skip", "/- open comment"]))
     assert [r.ok for r in results] == [True, False, False, False, False]
     # Errors are reported at their line within the proof...
     assert results[1].errors[0].line == 2 and "foo" in results[1].errors[0].message
@@ -67,8 +82,49 @@ def test_batch_attributes_errors():
 
 
 @needs_lean
-def test_statement_check():
-    checker = LeanChecker(Settings())
-    assert asyncio.run(checker.check_statement(REQ)).ok
+def test_statement_check(checker):
+    assert run(checker.check_statement(REQ)).ok
     bad = REQ.model_copy(update={"target": "a + c = b"})
-    assert not asyncio.run(checker.check_statement(bad)).ok
+    assert not run(checker.check_statement(bad)).ok
+
+
+@needs_lean
+def test_bad_import_fails_every_candidate(checker):
+    req = REQ.model_copy(update={"imports": ["Init", "No.Such.Module"]})
+    results = run(checker.check_many(req, ["omega", "rfl"]))
+    assert not any(r.ok for r in results)
+    assert not run(checker.check_statement(req)).ok
+
+
+@pytest.mark.skipif(not REPL.exists(), reason="no Lean REPL build")
+def test_repl_reuses_loaded_imports():
+    async def go():
+        c = ReplChecker(Settings(max_parallel_checks=1), REPL)
+        try:
+            await c.check(REQ, "omega")  # starts the worker
+            t = time.monotonic()
+            results = await asyncio.gather(*(c.check(REQ, "omega") for _ in range(5)))
+            return results, time.monotonic() - t
+        finally:
+            await c.close()
+
+    results, seconds = run(go())
+    assert all(r.ok for r in results)
+    assert seconds < 5  # no process start or import per check
+
+
+@pytest.mark.skipif(not REPL.exists(), reason="no Lean REPL build")
+def test_repl_timeout_restarts_worker():
+    async def go():
+        c = ReplChecker(Settings(max_parallel_checks=1, lean_timeout=3), REPL)
+        try:
+            slow = REQ.model_copy(update={"hypotheses": [], "target": "True"})
+            timed_out = await c.check(slow, "sleep 10000\ntrivial")
+            after = await c.check(REQ, "omega")
+            return timed_out, after
+        finally:
+            await c.close()
+
+    timed_out, after = run(go())
+    assert not timed_out.ok and "timed out" in timed_out.errors[0].message
+    assert after.ok
