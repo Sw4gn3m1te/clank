@@ -21,7 +21,7 @@ REQ = ProveRequest(
 
 REPL = Path(
     os.environ.get("CLANK_TEST_REPL")
-    or Path.home() / ".cache/clank/repl-v4.23.0/.lake/build/bin" / ("repl.exe" if os.name == "nt" else "repl")
+    or Path.home() / ".cache/clank/repl-v4.29.0/.lake/build/bin" / ("repl.exe" if os.name == "nt" else "repl")
 )
 CHECKERS = [
     "batch",

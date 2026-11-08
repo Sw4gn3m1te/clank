@@ -19,5 +19,5 @@ cache_path = "~/.cache/clank/proofs.sqlite"   # "" disables the cache
 lean_project = ".."               # relative to this file
 lean_timeout = 120.0
 max_parallel_checks = 2
-# repl_path = "~/.cache/clank/repl-v4.23.0/.lake/build/bin/repl"
+# repl_path = "~/.cache/clank/repl-v4.29.0/.lake/build/bin/repl"
 # warm_imports = ["Mathlib"]

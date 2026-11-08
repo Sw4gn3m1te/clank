@@ -103,12 +103,12 @@ def postJson (url : String) (body : Json) (timeout : Nat) : CoreM String := do
   let out ← IO.ofExcept stdout.get
   let err ← IO.ofExcept stderr.get
   if exitCode? != some 0 then
-    throwError "clank: request to {url} failed: {err.trim}{if out.isEmpty then "" else "\n" ++ out}"
+    throwError "clank: request to {url} failed: {err.trimAscii.copy}{if out.isEmpty then "" else "\n" ++ out}"
   return out
 
 /-- Ask the server at `endpoint` for candidate proofs. -/
 def prove (endpoint : String) (req : ProveRequest) (timeout : Nat) : CoreM ProveResponse := do
-  let url := endpoint.dropRightWhile (· == '/') ++ "/v1/prove"
+  let url := (endpoint.dropEndWhile (· == '/')).copy ++ "/v1/prove"
   let out ← postJson url req.toJson timeout
   let json ← match Json.parse out with
     | .ok j => pure j

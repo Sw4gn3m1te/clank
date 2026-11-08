@@ -110,6 +110,7 @@ Suggested order:
 
 - Development machine: **Windows** (Git Bash / MINGW64). vLLM needs Linux/WSL2; llama.cpp and Ollama run natively on Windows.
 - Lean is managed through `elan`. The Lake package is at the repo root.
+- Lean version: **v4.29.0**, pinned in `lean-toolchain` and `bench/lean-toolchain`, with Mathlib `v4.29.0` in `bench`. The tactic uses Lean internals and the `String.Slice` API, so it does not compile on v4.23. A user project must compile Clank with its own toolchain, and the REPL must be built for the same version.
 
 ## Conventions
 

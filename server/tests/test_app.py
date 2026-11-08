@@ -14,7 +14,7 @@ REQ = {
     "universes": [],
     "imports": ["Init"],
     "opens": [],
-    "lean_version": "4.23.0",
+    "lean_version": "4.29.0",
     "samples": 4,
 }
 

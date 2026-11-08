@@ -22,11 +22,11 @@ def allowedAxioms : List Name := [``propext, ``Classical.choice, ``Quot.sound]
 
 /-- Remove trailing blank lines and the common leading indentation of `text`. -/
 def dedent (text : String) : String :=
-  let lines := (text.splitOn "\n").map (·.trimRight)
+  let lines := (text.splitOn "\n").map (·.trimAsciiEnd.copy)
   let lines := lines.reverse.dropWhile (·.isEmpty) |>.reverse |>.dropWhile (·.isEmpty)
-  let indents := lines.filter (!·.isEmpty) |>.map fun l => (l.takeWhile (· == ' ')).length
+  let indents := lines.filter (!·.isEmpty) |>.map fun l => (l.toList.takeWhile (· == ' ')).length
   let n := indents.foldl min (indents.headD 0)
-  "\n".intercalate (lines.map (·.drop n))
+  "\n".intercalate (lines.map (·.drop n |>.copy))
 
 /-- Indent every line but the first by `n` spaces. -/
 def indentTail (n : Nat) (text : String) : String :=
@@ -113,10 +113,10 @@ def findPremises (goal : MVarId) (n : Nat) : TacticM (Array Premise) := do
 def fileContext (ref : Syntax) (n : Nat) : TacticM String := do
   let some pos := ref.getPos? | return ""
   if n == 0 then return ""
-  let before := (← getFileMap).source.extract 0 pos
+  let before := String.Pos.Raw.extract (← getFileMap).source 0 pos
   if before.length ≤ n then return before
   let tail := before.drop (before.length - n)
-  return (tail.dropWhile (· != '\n')).drop 1
+  return ((tail.dropWhile (· != '\n')).drop 1).copy
 
 /-- The request for the main goal, with the file context and premise hints. -/
 def fullRequest (ref : Syntax) : TacticM ProveRequest := do

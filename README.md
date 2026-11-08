@@ -60,11 +60,11 @@ Settings can also go in a TOML file passed with `--config` (or `CLANK_CONFIG`). 
 By default every check starts a fresh `lean` process, which reloads the imports each time: about
 20 s for Mathlib. With the [Lean REPL](https://github.com/leanprover-community/repl), the server
 keeps worker processes that load the imports once and then check a round of candidates in under
-a second. Build the REPL at the commit for your Lean version (for v4.23.0: `2f8073af`):
+a second. Build the REPL at the commit for your Lean version (for v4.29.0: `49577729`):
 
 ```sh
 git clone https://github.com/leanprover-community/repl && cd repl
-git checkout 2f8073af0a5e3a141fee075652790a2c19132516 && lake build
+git checkout 495777293cb9cc3c62787a8c11393da1a9dd9505 && lake build
 ```
 
 Then pass `--repl path/to/repl/.lake/build/bin/repl` and optionally `--warm Mathlib`, which
