@@ -25,6 +25,12 @@ structure Premise where
   /-- The lemma's signature, e.g. `Nat.add_comm (n m : Nat) : n + m = m + n`. -/
   statement : String
 
+/-- A project definition that the goal depends on. -/
+structure Definition where
+  name : String
+  /-- The definition's source text, without its docstring. -/
+  source : String
+
 /-- Body of `POST /v1/prove`. -/
 structure ProveRequest where
   /-- The goal as shown in the infoview. This is what the model sees. -/
@@ -42,6 +48,13 @@ structure ProveRequest where
   /-- Source text of the file before the `clank` call (trimmed), for the model to read. -/
   context : String := ""
   premises : Array Premise := #[]
+  /-- Names of the tactics that parse in the file's environment. -/
+  tactics : Array String := #[]
+  /-- The file up to the current declaration with earlier proofs replaced by `sorry`, for the
+  server to check candidates against. Empty if it could not be computed. -/
+  filePrefix : String := ""
+  /-- Project definitions the goal depends on, nearest first. -/
+  definitions : Array Definition := #[]
 
 structure Candidate where
   tactic : String
@@ -51,6 +64,8 @@ structure Candidate where
 structure ProveResponse where
   proofs : Array Candidate
   message : Option String := none
+  /-- The failed candidate that got furthest, when the search found no proof. -/
+  bestAttempt : Option String := none
 
 def Hypothesis.toJson (h : Hypothesis) : Json :=
   Json.mkObj [("name", Lean.toJson h.name), ("type", h.type), ("value", Lean.toJson h.value)]
@@ -68,7 +83,10 @@ def ProveRequest.toJson (r : ProveRequest) : Json :=
     ("samples", r.samples),
     ("timeout", r.timeout),
     ("context", r.context),
-    ("premises", Json.arr (r.premises.map fun p => Json.mkObj [("name", p.name), ("statement", p.statement)]))]
+    ("premises", Json.arr (r.premises.map fun p => Json.mkObj [("name", p.name), ("statement", p.statement)])),
+    ("tactics", Lean.toJson r.tactics),
+    ("prefix", r.filePrefix),
+    ("definitions", Json.arr (r.definitions.map fun d => Json.mkObj [("name", d.name), ("source", d.source)]))]
 
 def Candidate.fromJson? (j : Json) : Except String Candidate := do
   return { tactic := ← j.getObjValAs? String "tactic", verified := ← j.getObjValAs? Bool "verified" }
@@ -76,7 +94,8 @@ def Candidate.fromJson? (j : Json) : Except String Candidate := do
 def ProveResponse.fromJson? (j : Json) : Except String ProveResponse := do
   let proofs ← (← j.getObjValAs? (Array Json) "proofs").mapM Candidate.fromJson?
   let message := (j.getObjValAs? String "message").toOption
-  return { proofs, message }
+  let bestAttempt := (j.getObjValAs? String "best_attempt").toOption
+  return { proofs, message, bestAttempt }
 
 /--
 POST `body` to `url` and return the response body. Polls for completion so that the request can be

@@ -1,5 +1,12 @@
-from clank_server.prompt import PromptOptions, extract_proof, messages, split_context, statement
-from clank_server.protocol import Hypothesis, Premise, ProveRequest
+from clank_server.prompt import (
+    PromptOptions,
+    extract_proof,
+    messages,
+    split_context,
+    statement,
+    unavailable_tactics,
+)
+from clank_server.protocol import Definition, Hypothesis, Premise, ProveRequest
 
 REQ = ProveRequest(
     protocol=3,
@@ -51,6 +58,10 @@ def test_extract_rejects_forbidden_words():
     assert extract_proof("```lean\nnative_decide\n```") is None
     assert extract_proof("```lean\nclank\n```") is None  # would recurse in the tactic
     assert extract_proof("") is None
+    assert extract_proof("```lean\nexact?\n```") is None
+    assert extract_proof("```lean\nexact clank_check_0 a b\n```") is None
+    assert extract_proof("```lean\nintro h\nsimp? at h\n```") is None
+    assert extract_proof("```lean\nexact xs.head?\n```") == "exact xs.head?"
     assert extract_proof("```lean\nhave h : 1 = 1 := by sorry\nexact h\n```", allow_sorry=True)
     assert extract_proof("```lean\nhave h : 1 = 1 := by admit\n```", allow_sorry=True) is None
 
@@ -108,3 +119,39 @@ def test_messages_include_context_and_premises():
     assert "Eq.symm {a b : α}" in text and "Nat.add_comm" not in text  # max_premises=1
     chat = messages(req, PromptOptions(style="chat", context_chars=0, max_premises=0))[1]["content"]
     assert "double" not in chat and "Eq.symm" not in chat
+
+
+def test_definitions_labelled_within_budget_and_not_repeated():
+    req = REQ.model_copy(update={
+        "context": CONTEXT,
+        "definitions": [
+            Definition(name="A.near", source="def near := 1"),
+            Definition(name="A.huge", source="def huge := " + "1 + " * 100 + "1"),
+            Definition(name="double", source="def double (n : Nat) : Nat := n + n"),
+            Definition(name="A.far", source="def far := 2 /- note -/"),
+        ],
+    })
+    [prover] = messages(req, PromptOptions(max_definition_chars=60))
+    text = prover["content"]
+    assert "/- Definitions used in the goal:\n\n-- A.near\ndef near := 1\n\n-- A.far" in text
+    assert "/ - note - /" in text and "A.huge" not in text
+    assert "-- double" not in text  # already in the file context
+    assert text.index("-- A.near") < text.index("def double (n : Nat)")
+    chat = messages(req, PromptOptions(style="chat", max_definition_chars=60))[1]["content"]
+    assert "Definitions used in the goal:\n\n```lean\n-- A.near" in chat
+    assert "Definitions used" not in messages(req, PromptOptions(max_definition_chars=0))[0]["content"]
+
+
+def test_available_tactics_listed():
+    req = REQ.model_copy(update={"tactics": ["omega", "simp"]})
+    assert "any other tactic is an error:\nomega, simp" in messages(req)[0]["content"]
+    assert "omega, simp" in messages(req, PromptOptions(style="chat"))[1]["content"]
+    assert "any other tactic" not in messages(REQ)[0]["content"]
+    huge = REQ.model_copy(update={"tactics": [f"t{i}" for i in range(401)]})
+    assert "any other tactic" not in messages(huge)[0]["content"]
+
+
+def test_unavailable_tactics():
+    req = REQ.model_copy(update={"tactics": ["omega", "simp", "ring"]})
+    assert unavailable_tactics("simp\n<;> aesop\nring\nexact h.linarith", req) == ["aesop"]
+    assert unavailable_tactics("aesop", REQ) == []  # unknown environment

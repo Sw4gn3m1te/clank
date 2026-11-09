@@ -31,3 +31,8 @@ register_option clank.context : Nat := {
   defValue := 4000
   descr := "Characters of the file before the `clank` call sent as context; 0 disables"
 }
+
+register_option clank.definitions : Nat := {
+  defValue := 4000
+  descr := "Characters of project definitions used by the goal sent as context; 0 disables"
+}

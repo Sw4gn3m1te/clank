@@ -20,6 +20,12 @@ class Premise(BaseModel):
     statement: str
 
 
+class Definition(BaseModel):
+    name: str
+    # The definition's source text, without its docstring.
+    source: str
+
+
 class ProveRequest(BaseModel):
     protocol: int
     goal: str
@@ -38,6 +44,14 @@ class ProveRequest(BaseModel):
     context: str = ""
     # Library lemmas matching the goal, as hints.
     premises: list[Premise] = Field(default_factory=list)
+    # Tactics that parse in the file's environment (Lean core plus transitive imports).
+    # Empty means unknown, as in requests recorded before this field existed.
+    tactics: list[str] = Field(default_factory=list)
+    # The file up to the current declaration with earlier proofs replaced by `sorry`, for
+    # checking candidates in the file's own scope. Empty means check against the imports only.
+    prefix: str = ""
+    # Project definitions the goal depends on, nearest first.
+    definitions: list[Definition] = Field(default_factory=list)
 
 
 class Candidate(BaseModel):
@@ -50,5 +64,7 @@ class Candidate(BaseModel):
 class ProveResponse(BaseModel):
     proofs: list[Candidate]
     message: str | None = None
+    # The failed candidate that got furthest, when the search found no proof.
+    best_attempt: str | None = None
     # Diagnostics about the search (rounds, samples, timings). Informational only.
     stats: dict | None = None

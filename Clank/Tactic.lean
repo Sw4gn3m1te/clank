@@ -65,6 +65,17 @@ def openArgs : CoreM (Array String) := do
       args := args.push (toString ns ++ suffix)
   return args
 
+/-- Keywords of the tactics that parse in the current environment, which covers exactly the Lean
+core and the file's transitive imports. Symbolic and `?`/`!` variants are left out. -/
+def availableTactics : CoreM (Array String) := do
+  let some cat := Parser.getParserCategory? (← getEnv) `tactic | return #[]
+  let hidden := ["clank", "clank_dump", "sorry", "admit", "native_decide"]
+  let isWord (s : String) :=
+    s.front.isAlpha && s.all (fun c => c.isAlphanum || c == '_' || c == '\'') && !hidden.contains s
+  let names := cat.tables.leadingTable.foldl
+    (fun acc tk _ => let s := tk.toString (escape := false); if isWord s then acc.push s else acc) #[]
+  return names.qsort (· < ·)
+
 /-- Build the server request for `goal`. -/
 def mkRequest (goal : MVarId) (samples timeout : Nat) : TacticM ProveRequest := goal.withContext do
   let goalText := toString (← ppGoal goal)
@@ -87,7 +98,8 @@ def mkRequest (goal : MVarId) (samples timeout : Nat) : TacticM ProveRequest := 
       opens := ← openArgs
       leanVersion := Lean.versionString
       samples
-      timeout }
+      timeout
+      tactics := ← availableTactics }
 
 /-- Run `x` with `n` thousand heartbeats. Errors, including runtime ones, yield `fallback`. -/
 def withBudget (n : Nat) (fallback : α) (x : TacticM α) : TacticM α :=
@@ -118,6 +130,165 @@ def fileContext (ref : Syntax) (n : Nat) : TacticM String := do
   let tail := before.drop (before.length - n)
   return ((tail.dropWhile (· != '\n')).drop 1).copy
 
+/-- The proof of a `theorem`, `lemma` or `example` node with children `args`. -/
+def declProof? (args : Array Syntax) : Option Syntax :=
+  if args.size == 4 && (args[0]!.isToken "theorem" || args[0]!.isToken "lemma") then some args[3]!
+  else if args.size == 3 && args[0]!.isToken "example" then some args[2]!
+  else none
+
+/-- Text replacements, in source order, that remove the proofs from a command. -/
+partial def stubEdits (stx : Syntax) : Array (String.Pos.Raw × String.Pos.Raw × String) :=
+  let replace (part : Syntax) (text : String) := match part.getRange? with
+    | some r => #[(r.start, r.stop, text)]
+    | none => #[]
+  match stx with
+  | .node _ kind args =>
+    -- Replaying a `clank` call would make the server's own check call the server.
+    if kind == `Clank.clank || kind == `Clank.clankDump then replace stx "sorry"
+    else match declProof? args with
+      -- `where` clauses declare lemmas that later proofs may use, so those proofs stay.
+      | some proof =>
+        if proof.isOfKind ``Parser.Command.declValSimple && proof[3].isNone then
+          replace proof ":= sorry"
+        else args.flatMap stubEdits
+      | none => args.flatMap stubEdits
+  | _ => #[]
+
+/-- The text of `source` between `start` and `stop` with `edits` applied. -/
+def applyEdits (source : String) (start stop : String.Pos.Raw)
+    (edits : Array (String.Pos.Raw × String.Pos.Raw × String)) : String := Id.run do
+  let mut out := ""
+  let mut pos := start
+  for (first, last, text) in edits do
+    out := out ++ String.Pos.Raw.extract source pos first ++ text
+    pos := last
+  return out ++ String.Pos.Raw.extract source pos stop
+
+/-- Whether `cmd` only reports something, like `#eval` or `#check`. -/
+def isDiagnosticCommand (cmd : Syntax) : Bool :=
+  match cmd.find? (·.isAtom) with
+  | some (.atom _ val) => val.startsWith "#"
+  | _ => false
+
+/-- The file between its imports and the command containing `ref`, with earlier proofs replaced by
+`sorry`. Candidates only need the statements of earlier theorems, and rechecking their proofs would
+be slow. Namespaces, `variable`s and attributes stay, so the server's environment matches the file.
+Empty if the file does not parse. -/
+def stubbedPrefix (ref : Syntax) : TacticM String := do
+  let some pos := ref.getPos? | return ""
+  let source := (← getFileMap).source
+  let input := Parser.mkInputContext source "<clank>" (normalizeLineEndings := false)
+  let (_, start, headerMsgs) ← Parser.parseHeader input
+  if headerMsgs.hasErrors then return ""
+  let context : Parser.ParserModuleContext := { env := ← getEnv, options := ← getOptions }
+  let mut state := start
+  let mut out := ""
+  repeat
+    let (cmd, next, msgs) := Parser.parseCommand input context state {}
+    if msgs.hasErrors || Parser.isTerminalCommand cmd then return ""
+    if pos.byteIdx < next.pos.byteIdx then return out
+    unless isDiagnosticCommand cmd do
+      out := out ++ applyEdits source state.pos next.pos (stubEdits cmd)
+    state := next
+  return ""
+
+/-- Libraries the model knows already or that say nothing about the project. -/
+def isLibraryModule (m : Name) : Bool :=
+  [`Init, `Std, `Lean, `Mathlib, `Batteries, `Aesop, `Clank].any (·.isPrefixOf m)
+
+/-- Whether `n` comes from the project, which includes the current file. -/
+def isProjectConstant (env : Environment) (n : Name) : Bool :=
+  match env.getModuleIdxFor? n with
+  | some i => match env.header.moduleNames[i.toNat]? with
+    | some m => !isLibraryModule m
+    | none => false
+  | none => true
+
+/-- The constants a declaration's statement, body or constructors mention. -/
+def referencedConstants (ci : ConstantInfo) : Array Name :=
+  let type := ci.type.getUsedConstants
+  match ci with
+  | .defnInfo v => type ++ v.value.getUsedConstants
+  | .opaqueInfo v => type ++ v.value.getUsedConstants
+  | .inductInfo v => type ++ v.ctors.toArray
+  | _ => type
+
+/-- Whether `n` is compiler-generated or part of a declaration shown elsewhere. -/
+def isGeneratedConstant (env : Environment) (n : Name) (ci : ConstantInfo) : Bool :=
+  ci.isCtor || (env.getProjectionFnInfo? n).isSome || n.isInternal || isMatcherCore env n ||
+    isAuxRecursor env n || isNoConfusion env n || (match ci with | .recInfo _ => true | _ => false)
+
+/-- Add the project definitions reachable from `names` to `found`, looking through generated
+constants. Theorems are skipped, since a definition's meaning never depends on them. -/
+partial def collectDefinitions (env : Environment) (seen : IO.Ref NameSet) (found : IO.Ref (Array Name))
+    (names : Array Name) : IO Unit := do
+  for n in names do
+    unless isProjectConstant env n do continue
+    if (← seen.get).contains n then continue
+    seen.modify (·.insert n)
+    let some ci := env.find? n | continue
+    if ci matches .thmInfo _ then continue
+    if isGeneratedConstant env n ci then collectDefinitions env seen found (referencedConstants ci)
+    else found.modify (·.push n)
+
+/-- The source of module `m`, found next to its build output. -/
+def moduleSource (m : Name) : IO (Option String) := do
+  let olean := (← findOLean m).toString.replace "\\" "/"
+  let some root := (olean.splitOn ".lake/build/lib/lean/").head? | return none
+  let path : System.FilePath := root ++ "/".intercalate (m.components.map toString) ++ ".lean"
+  unless ← path.pathExists do return none
+  return some ((← IO.FS.readFile path).replace "\r\n" "\n")
+
+/-- Remove a leading docstring from a declaration's source. -/
+def stripDocstring (text : String) : String :=
+  let text := text.trimAscii.copy
+  if text.startsWith "/--" then "-/".intercalate ((text.splitOn "-/").drop 1) else text
+
+/-- The source text of `n`, or its signature if the source cannot be found. -/
+def declarationSource (n : Name) : TacticM String := do
+  let signature : TacticM String := return toString (← PrettyPrinter.ppSignature n).fmt
+  let some ranges ← findDeclarationRanges? n | signature
+  let env ← getEnv
+  let text? ← match env.getModuleIdxFor? n with
+    | none => pure (some (← getFileMap).source)
+    | some i => match env.header.moduleNames[i.toNat]? with
+      | some m => try moduleSource m catch _ => pure none
+      | none => pure none
+  let some text := text? | signature
+  let first := ranges.range.pos.line - 1
+  let count := ranges.range.endPos.line - ranges.range.pos.line + 1
+  return dedent (stripDocstring ("\n".intercalate (((text.splitOn "\n").drop first).take count)))
+
+/-- How many steps from the goal project definitions are collected. -/
+def definitionDepth : Nat := 3
+
+/-- Project definitions the goal depends on, nearest first, totalling at most `limit` characters.
+They are only context for the model, so a failing search just returns fewer. -/
+def findDefinitions (goal : MVarId) (limit : Nat) : TacticM (Array Definition) := do
+  if limit == 0 then return #[]
+  withBudget 20000 #[] <| goal.withContext do
+    let env ← getEnv
+    let mut frontier := (← instantiateMVars (← goal.getType)).getUsedConstants
+    for decl in ← getLCtx do
+      if decl.isImplementationDetail then continue
+      frontier := frontier ++ (← instantiateMVars decl.type).getUsedConstants
+      if let some v := decl.value? then
+        frontier := frontier ++ (← instantiateMVars v).getUsedConstants
+    let seen ← IO.mkRef ({} : NameSet)
+    let mut out : Array Definition := #[]
+    let mut used := 0
+    for _ in [0:definitionDepth] do
+      let found ← IO.mkRef #[]
+      collectDefinitions env seen found frontier
+      frontier := #[]
+      for n in ← found.get do
+        if let some ci := env.find? n then frontier := frontier ++ referencedConstants ci
+        let source ← declarationSource n
+        if used + source.length > limit then continue
+        used := used + source.length
+        out := out.push { name := n.toString, source }
+    return out
+
 /-- The request for the main goal, with the file context and premise hints. -/
 def fullRequest (ref : Syntax) : TacticM ProveRequest := do
   let goal ← getMainGoal
@@ -125,7 +296,9 @@ def fullRequest (ref : Syntax) : TacticM ProveRequest := do
   let req ← mkRequest goal (clank.samples.get opts) (clank.timeout.get opts)
   return { req with
     context := ← fileContext ref (clank.context.get opts)
-    premises := ← findPremises goal (clank.premises.get opts) }
+    premises := ← findPremises goal (clank.premises.get opts)
+    filePrefix := ← stubbedPrefix ref
+    definitions := ← findDefinitions goal (clank.definitions.get opts) }
 
 /-- Check that the (now assigned) `goal` has an acceptable proof term. -/
 def checkProofTerm (goal : MVarId) : TacticM Unit := do
@@ -211,20 +384,35 @@ syntax (name := clank) "clank" : tactic
       return
   let resp ← prove (clank.endpoint.get opts) (← fullRequest stx) (clank.timeout.get opts)
   let mut failures : Array MessageData := #[]
+  let mut parsedAttempt : Option String := none
   for cand in resp.proofs do
     let text := dedent cand.tactic
     match ← parseProof text with
     | .error e => failures := failures.push m!"{text}\n{e}"
     | .ok tac =>
       match ← runCandidate goal (relocate (SourceInfo.fromRef stx) tac) with
-      | some err => failures := failures.push m!"{text}\n{err}"
+      | some err =>
+        failures := failures.push m!"{text}\n{err}"
+        parsedAttempt := parsedAttempt <|> some text
       | none =>
         addSuggestion stx { suggestion := .string (← suggestionText stx text) }
         return
   let note := resp.message.map (m!"\n{·}") |>.getD m!""
   let details := failures.toList.take 3 |>.map (m!"\n\n" ++ ·)
-  throwError m!"clank: no proof found ({resp.proofs.size} candidates returned){note}" ++
+  let attempt? := (resp.bestAttempt.map dedent) <|> parsedAttempt <|>
+    (resp.proofs[0]?.map (dedent ·.tactic))
+  let attemptNote := attempt?.map (m!"\n\nMost promising attempt:\n{·}") |>.getD m!""
+  let msg := m!"clank: no proof found ({resp.proofs.size} candidates returned){note}{attemptNote}" ++
     MessageData.joinSep details m!""
+  unless (← read).recover do throwError msg
+  -- Throwing would backtrack the state and lose the suggestion, so report the error and admit.
+  if let some text := attempt? then
+    addSuggestion stx { suggestion := .string (← suggestionText stx text) }
+      (header := "Most promising attempt (does not close the goal):")
+      (codeActionPrefix? := some "Insert failed attempt: ")
+  logErrorAt stx msg
+  admitGoal goal
+  replaceMainGoal []
 
 /-- `clank_dump` logs the JSON request `clank` would send for the main goal and closes it with
 `sorry`. Used to build benchmark inputs and to debug the protocol. -/

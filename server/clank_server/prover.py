@@ -43,13 +43,22 @@ class Failure:
     proof: str
     result: CheckResult
 
+    @property
+    def in_scope(self) -> bool:
+        """False if the proof calls a tactic that the file's imports do not provide."""
+        return not any("unknown tactic" in e.message for e in self.result.errors)
+
     def score(self) -> tuple[float, int]:
         """Higher is more promising: how far into the proof the first error is, then fewer errors.
         A proof that runs to the end but leaves goals open scores highest."""
-        n = len(self.proof.splitlines())
+        proof_lines = [l.strip() for l in self.proof.splitlines()]
+        n = len(proof_lines)
         lines = [e.line for e in self.result.errors if e.line is not None]
-        if lines:
-            progress = (min(lines) - 1) / n
+        if not self.in_scope:
+            progress = -2.0
+        elif lines:
+            # Distinct lines only: repeating a no-op like `apply Eq.symm` is not progress.
+            progress = len(set(proof_lines[: min(lines) - 1])) / n
         elif any(e.message.startswith("unsolved goals") for e in self.result.errors):
             progress = 1.0
         else:  # timeout, disallowed axioms, ...
@@ -71,6 +80,8 @@ class Search:
     error: str | None = None
     # Duration of the latest Lean batch, to predict the next one.
     last_check: float = 0.0
+    # The request candidates were checked with, which has no prefix if the prefix did not compile.
+    check_req: ProveRequest | None = None
 
 
 def format_errors(result: CheckResult, limit: int = 3, width: int = 600) -> str:
@@ -105,7 +116,19 @@ class Prover:
 
     def _options(self) -> prompt.PromptOptions:
         s = self._settings
-        return prompt.PromptOptions(s.prompt_style, s.context_chars, s.max_premises)
+        return prompt.PromptOptions(
+            s.prompt_style, s.context_chars, s.max_premises, s.max_definition_chars
+        )
+
+    async def _restate(self, req: ProveRequest) -> tuple[ProveRequest, CheckResult]:
+        """Check that the goal can be stated server-side. Returns the outcome and the request to
+        check candidates with, which drops the file prefix if the prefix does not compile."""
+        stmt = await self._checker.check_statement(req)
+        if stmt.ok or not req.prefix:
+            return req, stmt
+        log.warning("cannot replay the file prefix: %s", stmt.first_error())
+        bare = req.model_copy(update={"prefix": ""})
+        return bare, await self._checker.check_statement(bare)
 
     async def _sample_repairs(self, req: ProveRequest, targets: list[Failure], n: int) -> list[str]:
         opts = self._options()
@@ -123,7 +146,8 @@ class Prover:
         s = self._settings
         start = time.monotonic()
         key = cache_key(req, self._env_id) if self._cache else None
-        if key and (cached := self._cache.get(key)):
+        usable = [p for p in (self._cache.get(key) or []) if not prompt.is_forbidden(p)] if key else []
+        if cached := usable:
             log.info("cache hit")
             return ProveResponse(
                 proofs=[Candidate(tactic=p, verified=True) for p in cached],
@@ -149,22 +173,28 @@ class Prover:
         if not search.verified:
             stats["seconds"] = round(time.monotonic() - start, 2)
             error = search.error
+            best = max((f for f in search.failures if f.in_scope), key=Failure.score, default=None)
             if error is None:
-                best = max(search.failures, key=Failure.score, default=None)
                 error = (
                     f"no proof found in {len(search.rounds)} rounds "
                     f"({len(search.seen)} distinct candidates)"
                 )
                 if best:
                     error += f"; most promising attempt failed with: {best.result.first_error()}"
-            return ProveResponse(proofs=[], message=error, stats=stats)
+            return ProveResponse(
+                proofs=[],
+                message=error,
+                # An attempt whose first step already fails shows nothing worth building on.
+                best_attempt=best.proof if best and best.score()[0] > 0 else None,
+                stats=stats,
+            )
 
         best = search.verified[0]
         if s.cleanup and fits(search.last_check):
             t0 = time.monotonic()
 
             async def still_ok(proofs: list[str]) -> list[bool]:
-                return [r.ok for r in await self._checker.check_many(req, proofs)]
+                return [r.ok for r in await self._checker.check_many(search.check_req or req, proofs)]
 
             cleaned = await minimize(best, still_ok, keep_going=lambda: fits(search.last_check))
             stats["cleanup"] = {
@@ -194,8 +224,9 @@ class Prover:
         out = Search()
         repaired: set[str] = set()
         # Check that the goal can be restated server-side while the model is sampling.
-        statement = asyncio.create_task(self._checker.check_statement(req))
+        statement = asyncio.create_task(self._restate(req))
         statement_checked = False
+        check_req = req
         try:
             for i, kind in enumerate(schedule):
                 if i > 0 and not fits(out.rounds[-1]["seconds"]):
@@ -206,12 +237,12 @@ class Prover:
                 if kind == "decompose":
                     if not statement_checked:
                         statement_checked = True
-                        stmt = await statement
+                        check_req, stmt = await statement
                         if not stmt.ok:
                             out.statement_error = stmt.first_error()
                             out.unverified = []
                             return out
-                    proofs, info = await self._decompose(req, n, fits)
+                    proofs, info = await self._decompose(check_req, n, fits)
                     out.verified = proofs
                     out.rounds.append({"kind": kind, **info, "verified": len(proofs),
                                        "seconds": round(time.monotonic() - t0, 2)})
@@ -240,15 +271,19 @@ class Prover:
                     break
 
                 candidates = []
+                out_of_scope = 0
                 for r in replies:
                     p = prompt.extract_proof(r)
                     if p and p not in out.seen:
                         out.seen.add(p)
-                        candidates.append(p)
+                        if prompt.unavailable_tactics(p, req):
+                            out_of_scope += 1
+                        else:
+                            candidates.append(p)
 
                 if candidates and not statement_checked:
                     statement_checked = True
-                    stmt = await statement
+                    check_req, stmt = await statement
                     if not stmt.ok:
                         # The tactic re-checks everything anyway, so hand over unchecked candidates.
                         log.warning("cannot restate goal server-side: %s", stmt.first_error())
@@ -257,7 +292,7 @@ class Prover:
                         return out
 
                 t1 = time.monotonic()
-                results = await self._checker.check_many(req, candidates) if candidates else []
+                results = await self._checker.check_many(check_req, candidates) if candidates else []
                 if candidates:
                     out.last_check = time.monotonic() - t1
                 ok = [c for c, r in zip(candidates, results) if r.ok]
@@ -267,6 +302,7 @@ class Prover:
                         "kind": kind,
                         "samples": len(replies),
                         "candidates": len(candidates),
+                        "out_of_scope": out_of_scope,
                         "verified": len(ok),
                         "seconds": round(time.monotonic() - t0, 2),
                     }
@@ -277,6 +313,7 @@ class Prover:
                     break
         finally:
             statement.cancel()
+        out.check_req = check_req
         return out
 
     async def _decompose(

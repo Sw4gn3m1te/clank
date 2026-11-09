@@ -15,7 +15,10 @@ Reply with the tactic proof only, inside a single ```lean code block. Do not res
 and do not start with `by`. Never use `sorry`, `admit` or `native_decide`."""
 
 # `clank` in a candidate would make the tactic call the server again while re-checking it.
-FORBIDDEN = re.compile(r"\b(sorry|admit|native_decide|clank|clank_dump)\b")
+# `clank_check_<i>` are the other candidates of the batch, which all state the very same goal.
+FORBIDDEN = re.compile(r"\b(sorry|admit|native_decide|clank|clank_dump|clank_check_\d+)\b")
+# Commands that search for a proof and report it, rather than being one.
+_SEARCH_TACTIC = re.compile(r"(?<![\w.'])(?:exact|apply|rw|simp|simpa|simp_all|dsimp|aesop|decide)\?")
 _THINK = re.compile(r"<think>.*?(</think>|$)", re.DOTALL)
 _FENCE = re.compile(r"```[ \t]*(?:lean4?|)[ \t]*\n(.*?)(?:```|$)", re.DOTALL)
 _DECL = re.compile(r"^\s*(?:theorem|lemma|example)\b.*?:=\s*by\b", re.DOTALL | re.MULTILINE)
@@ -26,6 +29,18 @@ _DECL_START = re.compile(
 )
 
 PROMPT_STYLES = ("prover", "chat")
+
+# Above this the list costs too much context. Environments that large include Mathlib, which is
+# what prover models are trained on, so they need the hint least.
+MAX_LISTED_TACTICS = 400
+
+# Prover models reach for these out of habit; Lean's `unknown tactic` error does not name them.
+_HABITUAL_TACTICS = re.compile(
+    r"(?<![\w.'])(aesop|linarith|nlinarith|norm_num|positivity|ring|ring_nf|field_simp|polyrith"
+    r"|tauto|push_neg|use|nth_rw|nth_rewrite|contrapose|contrapose!|by_contra|interval_cases"
+    r"|fin_cases|gcongr|bound|exacts|refine'|cases'|induction'|rcases|rintro|obtain"
+    r"|simp_arith|norm_cast|push_cast|choose|lift|peel|absurd)(?![\w'])"
+)
 
 SKETCH_INSTRUCTION = (
     "Write a proof sketch: state the key intermediate steps as `have` statements whose proofs "
@@ -39,6 +54,8 @@ class PromptOptions:
     # Characters of file context to include (the request may carry more).
     context_chars: int = 1500
     max_premises: int = 8
+    # Characters of project definitions to include.
+    max_definition_chars: int = 4000
 
 
 @dataclass
@@ -97,6 +114,37 @@ def _premises(req: ProveRequest, n: int) -> list[str]:
     return [p.statement for p in req.premises[:n]]
 
 
+def _definitions(req: ProveRequest, options: PromptOptions, ctx: FileContext) -> str:
+    """The definitions the goal depends on as labelled Lean source, nearest first and within the
+    budget. Source inside a namespace uses short names, hence the label with the full name."""
+    shown = f"{ctx.previous}\n{ctx.current}"
+    parts, used = [], 0
+    for d in req.definitions:
+        if d.source in shown or used + len(d.source) > options.max_definition_chars:
+            continue
+        used += len(d.source)
+        parts.append(f"-- {d.name}\n{d.source}")
+    return "\n\n".join(parts)
+
+
+def tactics_note(req: ProveRequest) -> str | None:
+    """A statement of which tactics exist in the file, or None if the list is unknown or too long."""
+    if not req.tactics or len(req.tactics) > MAX_LISTED_TACTICS:
+        return None
+    return (
+        "Only these tactics are available in this file, any other tactic is an error:\n"
+        + ", ".join(req.tactics)
+    )
+
+
+def unavailable_tactics(proof: str, req: ProveRequest) -> list[str]:
+    """Commonly used tactics that `proof` calls but the file's environment does not provide."""
+    if not req.tactics:
+        return []
+    known = set(req.tactics)
+    return sorted({m.group(1) for m in _HABITUAL_TACTICS.finditer(proof)} - known)
+
+
 def messages(
     req: ProveRequest,
     options: PromptOptions | None = None,
@@ -111,10 +159,14 @@ def messages(
     ctx = split_context(req.context, options.context_chars)
     code = "\n\n".join(p for p in (preamble(req), ctx.previous, statement(req)) if p)
     user = f"Prove the following Lean 4 goal.\n\n```lean\n{req.goal}\n```\n\n"
+    if definitions := _definitions(req, options, ctx):
+        user += f"Definitions used in the goal:\n\n```lean\n{definitions}\n```\n\n"
     if ctx.current:
         user += f"It arises in this proof:\n\n```lean\n{ctx.current}\n```\n\n"
     if premises := _premises(req, options.max_premises):
         user += "Possibly useful lemmas:\n" + "\n".join(f"- `{p}`" for p in premises) + "\n\n"
+    if note := tactics_note(req):
+        user += f"{note}\n\n"
     user += f"Complete this theorem:\n\n```lean\n{code}\n```"
     if sketch:
         user += f"\n\n{SKETCH_INSTRUCTION}"
@@ -145,13 +197,18 @@ def prover_messages(
     declarations of the user's file appear as code; everything else goes into comments."""
     options = options or PromptOptions()
     ctx = split_context(req.context, options.context_chars)
-    parts = [preamble(req), ctx.previous]
+    parts = [preamble(req)]
+    if definitions := _definitions(req, options, ctx):
+        parts.append(f"/- Definitions used in the goal:\n\n{_uncomment(definitions)}\n-/")
+    parts.append(ctx.previous)
     if premises := _premises(req, options.max_premises):
         parts.append(
             "/- Possibly useful lemmas:\n"
             + "\n".join(textwrap.indent(_uncomment(p), "  ") for p in premises)
             + "\n-/"
         )
+    if note := tactics_note(req):
+        parts.append(f"/- {_uncomment(note)} -/")
     goal = f"/- Goal:\n{textwrap.indent(req.goal, '  ')}"
     if ctx.current:
         goal += f"\nIt arises in this proof:\n{textwrap.indent(_uncomment(ctx.current), '  ')}"
@@ -187,9 +244,12 @@ def extract_proof(text: str, allow_sorry: bool = False) -> str | None:
     if proof.startswith("by") and (len(proof) == 2 or proof[2].isspace()):
         proof = textwrap.dedent(proof[2:].strip("\n")).strip()
     proof = textwrap.dedent("\n".join(line.rstrip() for line in proof.splitlines()))
-    if not proof:
-        return None
+    return None if not proof or is_forbidden(proof, allow_sorry) else proof
+
+
+def is_forbidden(proof: str, allow_sorry: bool = False) -> bool:
+    """Whether `proof` uses something a finished proof must not. `allow_sorry` admits `sorry`."""
     bad = {m.group(1) for m in FORBIDDEN.finditer(proof)}
     if allow_sorry:
         bad.discard("sorry")
-    return None if bad else proof
+    return bool(bad) or _SEARCH_TACTIC.search(proof) is not None

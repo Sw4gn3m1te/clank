@@ -5,8 +5,8 @@ $modelHealth = 'http://127.0.0.1:8080/health'
 $modelArgs = @(
     '-hf', 'unsloth/DeepSeek-Prover-V2-7B-GGUF:Q8_0',
     '--port', '8080',
-    '-np', '8',
-    '-c', '16384',
+    '-np', '4',
+    '-c', '32768',
     '-ngl', '99',
     '-fa', 'on',
     '-ctk', 'q8_0',
@@ -51,7 +51,7 @@ try {
     Write-Host 'Starting Clank server...'
     Push-Location (Join-Path $PSScriptRoot 'server')
     try {
-        & $python -m clank_server --lean-project ..
+        & $python -m clank_server --lean-project ..\Test-Projects\Existential-Rules-in-Lean-Core --max-tokens 4096
     } finally {
         Pop-Location
     }

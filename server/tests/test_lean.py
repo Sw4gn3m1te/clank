@@ -6,7 +6,17 @@ from pathlib import Path
 import pytest
 
 from clank_server.config import Settings
-from clank_server.lean import LeanChecker, ReplChecker, render
+from clank_server.cache import cache_key
+from clank_server.lean import (
+    LeanChecker,
+    ReplChecker,
+    _results,
+    _Run,
+    _Span,
+    header,
+    render,
+    render_body,
+)
 from clank_server.protocol import Hypothesis, ProveRequest
 
 from conftest import needs_lean
@@ -51,6 +61,36 @@ def test_render():
     assert lines[spans[0].first - 1] == "theorem clank_check_0 (a : Nat) (b : Nat) :"
     assert lines[spans[0].proof - 1 : spans[0].last] == ["  intro", "  omega", "#print axioms clank_check_0"]
     assert lines[spans[1].proof - 1] == "  rfl"
+
+
+def test_render_with_prefix():
+    prefix = "universe u\nnamespace A\ntheorem t : True := sorry\n"
+    req = REQ.model_copy(update={"prefix": prefix, "universes": ["u", "v"]})
+    assert header(req) == "import Clank"
+    assert header(REQ) == ""
+    body, [span] = render_body(req, ["omega"])
+    lines = body.splitlines()
+    assert lines[:3] == prefix.splitlines()
+    assert "universe v" in lines and "universe u v" not in lines
+    assert lines[span.proof - 1] == "  omega"
+
+
+def test_stubbed_theorems_do_not_fail_candidates():
+    spans = [_Span(first=10, proof=12, last=13)]
+    stub_warning = {"severity": "warning", "kind": "hasSorry", "pos": {"line": 3}, "data": "sorry"}
+    axioms = {"severity": "information", "pos": {"line": 13},
+              "data": "'A.clank_check_0' depends on axioms: [propext, sorryAx]"}
+    run = _Run([stub_warning, axioms])
+    assert _results(run, spans, 1.0, stubs=True)[0].ok
+    without_stubs = _results(run, spans, 1.0)[0]
+    assert not without_stubs.ok and without_stubs.only_sorry
+    prefix_error = {"severity": "error", "pos": {"line": 3}, "data": "bad"}
+    assert not _results(_Run([prefix_error, axioms]), spans, 1.0, stubs=True)[0].ok
+
+
+def test_cache_key_depends_on_prefix():
+    edited = REQ.model_copy(update={"prefix": "theorem t : True := sorry\n"})
+    assert cache_key(REQ, "env") != cache_key(edited, "env")
 
 
 @needs_lean

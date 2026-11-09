@@ -2,7 +2,11 @@ import httpx
 from fastapi.testclient import TestClient
 
 from clank_server.app import create_app
+from clank_server.cache import ProofCache, cache_key
 from clank_server.config import Settings
+from clank_server.lean import CheckResult, LeanError
+from clank_server.protocol import ProveRequest
+from clank_server.prover import Failure
 
 from conftest import fake_llm, needs_lean
 
@@ -45,7 +49,8 @@ def test_prove_returns_verified_proofs():
     assert body["message"] is None
     [round0] = body["stats"]["rounds"]
     assert round0 | {"seconds": 0} == {
-        "kind": "fresh", "samples": 4, "candidates": 3, "verified": 2, "seconds": 0
+        "kind": "fresh", "samples": 4, "candidates": 3, "out_of_scope": 0, "verified": 2,
+        "seconds": 0
     }
 
 
@@ -79,6 +84,50 @@ def test_prove_reports_failure():
     assert body["proofs"] == []
     assert "no proof found in 4 rounds (1 distinct candidates)" in body["message"]
     assert "rfl" in body["message"]
+    assert body["best_attempt"] is None  # failed at its first step
+
+
+@needs_lean
+def test_best_attempt_got_past_its_first_step():
+    proof = "have h : 1 = 1 := rfl\nrfl"
+    with client([f"```lean\n{proof}\n```"]) as c:
+        body = c.post("/v1/prove", json=REQ).json()
+    assert body["proofs"] == [] and body["best_attempt"] == proof
+
+
+@needs_lean
+def test_cached_search_commands_are_ignored(tmp_path):
+    db = tmp_path / "proofs.sqlite"
+    ProofCache(db).put(cache_key(ProveRequest(**REQ), "core"), ["exact?"])
+    with client(["```lean\nomega\n```"], cache_path=db) as c:
+        body = c.post("/v1/prove", json=REQ).json()
+    assert body["proofs"] == [{"tactic": "omega", "verified": True}]
+
+
+@needs_lean
+def test_unusable_prefix_falls_back_to_imports():
+    with client(["```lean\nomega\n```"]) as c:
+        body = c.post("/v1/prove", json={**REQ, "prefix": "this is not lean !!!\n"}).json()
+    assert body["proofs"] == [{"tactic": "omega", "verified": True}]
+
+
+def test_score_ignores_padding_and_out_of_scope_tactics():
+    def failure(proof, line, message="type mismatch"):
+        return Failure(proof, CheckResult(False, [LeanError(line, message)]))
+
+    padded = failure("apply Eq.symm\napply Eq.symm\napply Eq.symm\napply Eq.symm\nsimp", 5)
+    real = failure("intro h\nsimp at h\ncases h\nrfl\nexact h", 4)
+    assert real.score() > padded.score()
+    unknown = failure("intro h\nsimp\nfoo", 3, "<input>:3:0: unknown tactic")
+    assert not unknown.in_scope and padded.score() > unknown.score()
+
+
+@needs_lean
+def test_out_of_scope_tactics_are_not_checked_or_offered():
+    with client(["```lean\naesop\n```"]) as c:
+        body = c.post("/v1/prove", json={**REQ, "tactics": ["omega"]}).json()
+    assert body["proofs"] == [] and body["best_attempt"] is None
+    assert body["stats"]["rounds"][0]["out_of_scope"] == 1
 
 
 @needs_lean

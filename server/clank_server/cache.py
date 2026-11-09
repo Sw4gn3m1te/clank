@@ -39,6 +39,9 @@ def cache_key(req: ProveRequest, env_id: str) -> str:
         "lean_version": req.lean_version,
         "env": env_id,
     }
+    # Only when present, so that existing entries for prefix-less requests stay valid.
+    if req.prefix:
+        data["prefix"] = req.prefix
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 

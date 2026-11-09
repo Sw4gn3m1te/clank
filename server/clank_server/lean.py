@@ -32,8 +32,10 @@ log = logging.getLogger(__name__)
 
 DECL_PREFIX = "clank_check"
 ALLOWED_AXIOMS = {"propext", "Classical.choice", "Quot.sound"}
-_AXIOMS_RE = re.compile(r"'(\w+)' depends on axioms: \[(.*)\]", re.DOTALL)
-_NO_AXIOMS_RE = re.compile(r"'(\w+)' does not depend on any axioms")
+# The names are qualified when the check runs inside a namespace of the file prefix.
+_AXIOMS_RE = re.compile(r"'(.+?)' depends on axioms: \[(.*)\]", re.DOTALL)
+_NO_AXIOMS_RE = re.compile(r"'(.+?)' does not depend on any axioms")
+_UNIVERSE_RE = re.compile(r"^\s*universe\s+([^\n]+)", re.MULTILINE)
 
 
 @dataclass
@@ -80,15 +82,20 @@ class _Run:
 
 
 def header(req: ProveRequest) -> str:
-    return "\n".join(f"import {m}" for m in req.imports if m != "Init")
+    # The tactic leaves itself out of `imports`, but a prefix can contain `set_option clank.*`.
+    imports = [*req.imports, "Clank"] if req.prefix else req.imports
+    return "\n".join(f"import {m}" for m in imports if m != "Init")
 
 
 def render_body(req: ProveRequest, proofs: list[str]) -> tuple[str, list[_Span]]:
     """The goal stated once per proof, as `clank_check_<i>`. Span lines are 1-based within the body."""
     # Unknown identifiers in a restated goal must be errors, not auto-bound variables.
-    out = ["set_option autoImplicit false", *(f"open {o}" for o in req.opens)]
-    if req.universes:
-        out.append("universe " + " ".join(req.universes))
+    out = [*req.prefix.splitlines(), "set_option autoImplicit false"]
+    out += [f"open {o}" for o in req.opens]
+    # Lean rejects declaring a universe that the prefix has already declared.
+    declared = {u for names in _UNIVERSE_RE.findall(req.prefix) for u in names.split()}
+    if universes := [u for u in req.universes if u not in declared]:
+        out.append("universe " + " ".join(universes))
     binders = "".join(f" {binder(h.name, h.type)}" for h in req.hypotheses)
     spans = []
     for i, proof in enumerate(proofs):
@@ -129,8 +136,11 @@ def _kill_tree(proc: subprocess.Popen) -> None:
     proc.kill()
 
 
-def _results(run: _Run, spans: list[_Span], timeout: float) -> list[CheckResult]:
-    """Attribute the messages of a run to the candidates whose theorems they belong to."""
+def _results(run: _Run, spans: list[_Span], timeout: float, stubs: bool = False) -> list[CheckResult]:
+    """Attribute the messages of a run to the candidates whose theorems they belong to. With
+    `stubs`, a candidate may depend on `sorry` through the prefix's stubbed theorems. A `sorry`
+    of its own is still an error, and the tactic's final check rejects both."""
+    allowed = ALLOWED_AXIOMS | {"sorryAx"} if stubs else ALLOWED_AXIOMS
     errors: list[list[LeanError]] = [[] for _ in spans]
     infos: list[list[tuple[int, int, str]]] = [[] for _ in spans]
     axioms_ok = [False] * len(spans)
@@ -141,7 +151,7 @@ def _results(run: _Run, spans: list[_Span], timeout: float) -> list[CheckResult]
         k = next((k for k, s in enumerate(spans) if s.first <= line <= s.last), None)
         is_error = m.get("severity") == "error" or m.get("kind") == "hasSorry"
         if k is None:
-            if is_error:
+            if m.get("severity") == "error":
                 global_errors.append(data)
             continue
         rel = line - spans[k].proof + 1
@@ -151,9 +161,9 @@ def _results(run: _Run, spans: list[_Span], timeout: float) -> list[CheckResult]
             errors[k].append(LeanError(rel if in_proof else None, data, sorry))
         elif ax := _AXIOMS_RE.match(data):
             used = {a.strip() for a in ax.group(2).split(",") if a.strip()}
-            axioms_ok[k] = used <= ALLOWED_AXIOMS
+            axioms_ok[k] = used <= allowed
             if not axioms_ok[k]:
-                bad = sorted(used - ALLOWED_AXIOMS)
+                bad = sorted(used - allowed)
                 errors[k].append(LeanError(None, f"disallowed axioms: {bad}", bad == ["sorryAx"]))
         elif _NO_AXIOMS_RE.match(data):
             axioms_ok[k] = True
@@ -234,7 +244,7 @@ class LeanChecker:
         if todo:
             body, spans = render_body(req, [proofs[i] for i in todo])
             run = await self._run(header(req), body)
-            for i, r in zip(todo, _results(run, spans, self._settings.lean_timeout)):
+            for i, r in zip(todo, _results(run, spans, self._settings.lean_timeout, bool(req.prefix))):
                 results[i] = r
         return results  # type: ignore[return-value]
 

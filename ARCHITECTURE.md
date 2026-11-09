@@ -53,8 +53,10 @@ Editor ── `clank` (Lean tactic, thin)
   - require no `sorry` in the instantiated proof term;
   - restore the saved state on failure.
 - On success: `Lean.Meta.Tactic.TryThis.addSuggestion`.
+- On failure: logs the error with the most promising attempt, offers that attempt through the same suggestion mechanism, and admits the goal. Inside `first`/`try` it throws instead.
 - Options via `register_option` (e.g. `clank.endpoint`, `clank.samples`, `clank.timeout`).
 - Fast path: try cheap tactics (`simp`, `omega`, `decide`, `aesop`, …) before calling the server.
+- Sends the tactics in the environment's parser table, so the model is limited to Lean core and the file's transitive imports.
 - Respects heartbeats and `checkInterrupted`, so it never hangs the editor.
 
 ### Python server (`server/`)
@@ -99,7 +101,7 @@ Budget:
 - Small projects can skip retrieval and send every project statement without proofs.
 - Put the project block at the start of the prompt and keep it stable across samples, so llama-server's prompt cache can reuse it.
 
-Related fix: restate goals server-side against the file prefix (everything before the `clank` call), not just its imports, so goals that use same-file definitions still get repair and decompose.
+Built: the tactic sends the file up to the current declaration with earlier proofs replaced by `sorry`, and the server checks candidates against it, falling back to imports only if it does not compile. It also sends the project definitions the goal uses, up to three steps away. The retrieval index above is not built.
 
 Suggested order:
 1. Raise `context_chars`, and have the Lean side send the definitions the goal uses.

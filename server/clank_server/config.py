@@ -24,6 +24,7 @@ class Settings:
     # prompt small enough for the model's context (llama.cpp splits -c across -np slots).
     context_chars: int = 1500
     max_premises: int = 8
+    max_definition_chars: int = 4000
     temperature: float = 0.8
     max_tokens: int = 1024
     llm_timeout: float = 120.0
@@ -122,6 +123,8 @@ def add_arguments(p: argparse.ArgumentParser, env: Settings) -> None:
                    help="characters of file context in prompts (0 disables)")
     p.add_argument("--max-premises", type=int, default=env.max_premises,
                    help="lemma hints in prompts (0 disables)")
+    p.add_argument("--max-definition-chars", type=int, default=env.max_definition_chars,
+                   help="characters of project definitions in prompts (0 disables)")
     p.add_argument("--temperature", type=float, default=env.temperature)
     p.add_argument("--max-tokens", type=int, default=env.max_tokens)
     p.add_argument(
@@ -161,6 +164,7 @@ def from_arguments(args: argparse.Namespace, env: Settings) -> Settings:
         prompt_style=args.prompt_style,
         context_chars=args.context_chars,
         max_premises=args.max_premises,
+        max_definition_chars=args.max_definition_chars,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         schedule=schedule,
